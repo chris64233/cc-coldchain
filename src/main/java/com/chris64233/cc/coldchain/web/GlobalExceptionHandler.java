@@ -46,6 +46,14 @@ public class GlobalExceptionHandler {
                 .body(ErrorResponse.of("NOT_FOUND", "资源不存在", HttpStatus.NOT_FOUND.value()));
     }
 
+    @ExceptionHandler(org.springframework.dao.DataIntegrityViolationException.class)
+    public ResponseEntity<ErrorResponse> handleDataIntegrity(
+            org.springframework.dao.DataIntegrityViolationException ex) {
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(ErrorResponse.of("DATA_INTEGRITY_VIOLATION", "数据唯一性或完整性约束冲突",
+                        HttpStatus.CONFLICT.value()));
+    }
+
     @ExceptionHandler(Exception.class)
     public ResponseEntity<ErrorResponse> handleUnexpected(Exception ex) {
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)

@@ -1,18 +1,22 @@
 package com.chris64233.cc.coldchain.service;
 
+import com.chris64233.cc.coldchain.domain.BreachInterval;
 import com.chris64233.cc.coldchain.domain.HandoverRecord;
 import com.chris64233.cc.coldchain.domain.HandoverStatus;
+import com.chris64233.cc.coldchain.domain.PackingUnit;
 import com.chris64233.cc.coldchain.domain.Shipment;
 import com.chris64233.cc.coldchain.domain.ShipmentStatus;
 import com.chris64233.cc.coldchain.domain.TemperatureEvent;
+import com.chris64233.cc.coldchain.domain.UnitStatus;
 import com.chris64233.cc.coldchain.repository.HandoverRecordRepository;
+import com.chris64233.cc.coldchain.repository.PackingUnitRepository;
 import com.chris64233.cc.coldchain.repository.ShipmentRepository;
 import com.chris64233.cc.coldchain.repository.TemperatureEventRepository;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 
@@ -22,13 +26,19 @@ public class ColdChainService {
     private final ShipmentRepository shipmentRepository;
     private final TemperatureEventRepository temperatureEventRepository;
     private final HandoverRecordRepository handoverRecordRepository;
+    private final PackingUnitRepository packingUnitRepository;
+    private final InvestigationService investigationService;
 
     public ColdChainService(ShipmentRepository shipmentRepository,
                             TemperatureEventRepository temperatureEventRepository,
-                            HandoverRecordRepository handoverRecordRepository) {
+                            HandoverRecordRepository handoverRecordRepository,
+                            PackingUnitRepository packingUnitRepository,
+                            @Lazy InvestigationService investigationService) {
         this.shipmentRepository = shipmentRepository;
         this.temperatureEventRepository = temperatureEventRepository;
         this.handoverRecordRepository = handoverRecordRepository;
+        this.packingUnitRepository = packingUnitRepository;
+        this.investigationService = investigationService;
     }
 
     @Transactional
@@ -70,7 +80,7 @@ public class ColdChainService {
         }
         TemperatureEvent event = temperatureEventRepository.saveAndFlush(
                 new TemperatureEvent(shipment, eventId, sampledAt, temperature));
-        recomputeQuarantine(shipment);
+        recomputeState(shipment);
         return event;
     }
 
@@ -127,40 +137,69 @@ public class ColdChainService {
         return handoverRecordRepository.findByShipmentIdOrderByInitiatedAtAscIdAsc(shipment.getId());
     }
 
-    private Shipment lockShipment(String waybillNo) {
+    @Transactional
+    public PackingUnit registerPackingUnit(String waybillNo, String unitCode) {
+        Shipment shipment = lockShipment(waybillNo);
+        var existing = packingUnitRepository.findByShipmentIdAndUnitCode(shipment.getId(), unitCode);
+        if (existing.isPresent()) {
+            return existing.get();
+        }
+        UnitStatus initialStatus = shipment.getStatus() == ShipmentStatus.QUARANTINED
+                ? UnitStatus.QUARANTINED
+                : UnitStatus.IN_TRANSIT;
+        try {
+            return packingUnitRepository.saveAndFlush(new PackingUnit(shipment, unitCode, initialStatus));
+        } catch (DataIntegrityViolationException ex) {
+            return packingUnitRepository.findByShipmentIdAndUnitCode(shipment.getId(), unitCode).orElseThrow();
+        }
+    }
+
+    @Transactional(readOnly = true)
+    public List<PackingUnit> listPackingUnits(String waybillNo) {
+        Shipment shipment = getShipment(waybillNo);
+        return packingUnitRepository.findByShipmentIdOrderByIdAsc(shipment.getId());
+    }
+
+    Shipment lockShipment(String waybillNo) {
         return shipmentRepository.findByWaybillNoForUpdate(waybillNo)
                 .orElseThrow(() -> ApiException.notFound("运单不存在: " + waybillNo));
     }
 
-    private void recomputeQuarantine(Shipment shipment) {
-        if (shipment.getStatus() == ShipmentStatus.QUARANTINED) {
-            return;
-        }
+    private void recomputeState(Shipment shipment) {
         List<TemperatureEvent> events =
                 temperatureEventRepository.findByShipmentIdOrderBySampledAtAscIdAsc(shipment.getId());
-        Duration maxBreach = Duration.ofSeconds(shipment.getMaxBreachSeconds());
-        Instant breachStart = null;
-        Instant lastBreachSample = null;
-        for (TemperatureEvent event : events) {
-            boolean outOfRange = event.getTemperature() < shipment.getTempMin()
-                    || event.getTemperature() > shipment.getTempMax();
-            if (outOfRange) {
-                if (breachStart == null) {
-                    breachStart = event.getSampledAt();
-                }
-                lastBreachSample = event.getSampledAt();
-            } else if (breachStart != null) {
-                if (Duration.between(breachStart, event.getSampledAt()).compareTo(maxBreach) >= 0) {
-                    shipment.setStatus(ShipmentStatus.QUARANTINED);
-                    return;
-                }
-                breachStart = null;
-                lastBreachSample = null;
+        List<BreachCalculator.BreachSegment> segments = BreachCalculator.compute(
+                events, shipment.getTempMin(), shipment.getTempMax(), shipment.getMaxBreachSeconds());
+        List<BreachInterval> confirmed = BreachCalculator.confirmedIntervals(segments);
+        String newSnapshot = BreachInterval.format(confirmed);
+
+        if (shipment.getStatus() != ShipmentStatus.QUARANTINED) {
+            if (BreachCalculator.isQuarantined(segments)) {
+                shipment.setStatus(ShipmentStatus.QUARANTINED);
+                shipment.setEvidenceVersion(shipment.getEvidenceVersion() + 1);
+                shipment.setBreachSnapshot(newSnapshot);
+                markUnitsQuarantined(shipment);
             }
+            return;
         }
-        if (breachStart != null
-                && Duration.between(breachStart, lastBreachSample).compareTo(maxBreach) >= 0) {
-            shipment.setStatus(ShipmentStatus.QUARANTINED);
+
+        // 已隔离：晚到的历史事件若扩大了异常区间，证据版本递增，未完成的结论失效。
+        List<BreachInterval> previous = BreachInterval.parse(shipment.getBreachSnapshot());
+        if (BreachInterval.isExpanded(previous, confirmed)) {
+            shipment.setEvidenceVersion(shipment.getEvidenceVersion() + 1);
+            shipment.setBreachSnapshot(newSnapshot);
+            investigationService.supersedeUnfinishedInvestigations(
+                    shipment, shipment.getEvidenceVersion(),
+                    "晚到的历史温度事件扩大了异常区间，证据版本升级为 " + shipment.getEvidenceVersion()
+                            + "，原结论失效，需重新评估");
+        }
+    }
+
+    private void markUnitsQuarantined(Shipment shipment) {
+        for (PackingUnit unit : packingUnitRepository.findByShipmentIdOrderByIdAsc(shipment.getId())) {
+            if (unit.getStatus() == UnitStatus.IN_TRANSIT) {
+                unit.setStatus(UnitStatus.QUARANTINED);
+            }
         }
     }
 }

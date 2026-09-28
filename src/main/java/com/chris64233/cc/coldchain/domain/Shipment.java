@@ -41,6 +41,20 @@ public class Shipment {
     @Column(name = "status", nullable = false, length = 16)
     private ShipmentStatus status = ShipmentStatus.IN_TRANSIT;
 
+    /**
+     * 异常证据版本：触发隔离或已确认的越界区间集合发生扩大时递增。
+     * 调查持有创建时的版本号，晚到事件扩大异常区间后旧结论即失效。
+     */
+    @Column(name = "evidence_version", nullable = false)
+    private int evidenceVersion = 0;
+
+    /**
+     * 当前已确认（达到允许连续越界时长）的异常区间快照，
+     * 形如 {@code [startEpochMillis,endEpochMillis];...}，按开始时间排序。
+     */
+    @Column(name = "breach_snapshot", length = 4000)
+    private String breachSnapshot;
+
     @Column(name = "created_at", nullable = false)
     private Instant createdAt = Instant.now();
 
@@ -91,6 +105,22 @@ public class Shipment {
 
     public Instant getCreatedAt() {
         return createdAt;
+    }
+
+    public int getEvidenceVersion() {
+        return evidenceVersion;
+    }
+
+    public String getBreachSnapshot() {
+        return breachSnapshot;
+    }
+
+    public void setEvidenceVersion(int evidenceVersion) {
+        this.evidenceVersion = evidenceVersion;
+    }
+
+    public void setBreachSnapshot(String breachSnapshot) {
+        this.breachSnapshot = breachSnapshot;
     }
 
     public void setCurrentHolder(String currentHolder) {

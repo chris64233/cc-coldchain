@@ -14,6 +14,7 @@ public record ShipmentResponse(
         String currentHolder,
         Instant departureTime,
         ShipmentStatus status,
+        int evidenceVersion,
         Instant createdAt) {
 
     public static ShipmentResponse from(Shipment shipment) {
@@ -26,6 +27,7 @@ public record ShipmentResponse(
                 shipment.getCurrentHolder(),
                 shipment.getDepartureTime(),
                 shipment.getStatus(),
+                shipment.getEvidenceVersion(),
                 shipment.getCreatedAt());
     }
 }
