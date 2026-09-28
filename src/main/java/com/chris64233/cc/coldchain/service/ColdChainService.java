@@ -12,7 +12,6 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 
@@ -22,13 +21,16 @@ public class ColdChainService {
     private final ShipmentRepository shipmentRepository;
     private final TemperatureEventRepository temperatureEventRepository;
     private final HandoverRecordRepository handoverRecordRepository;
+    private final InvestigationService investigationService;
 
     public ColdChainService(ShipmentRepository shipmentRepository,
                             TemperatureEventRepository temperatureEventRepository,
-                            HandoverRecordRepository handoverRecordRepository) {
+                            HandoverRecordRepository handoverRecordRepository,
+                            InvestigationService investigationService) {
         this.shipmentRepository = shipmentRepository;
         this.temperatureEventRepository = temperatureEventRepository;
         this.handoverRecordRepository = handoverRecordRepository;
+        this.investigationService = investigationService;
     }
 
     @Transactional
@@ -71,6 +73,11 @@ public class ColdChainService {
         TemperatureEvent event = temperatureEventRepository.saveAndFlush(
                 new TemperatureEvent(shipment, eventId, sampledAt, temperature));
         recomputeQuarantine(shipment);
+        // 即使货物已隔离，事件始终接收；后到的历史事件若扩大异常区间，
+        // 必须使未完成的调查结论失效。
+        if (shipment.getStatus() == ShipmentStatus.QUARANTINED) {
+            investigationService.invalidateIfEvidenceExpanded(shipment, currentSnapshot(shipment));
+        }
         return event;
     }
 
@@ -83,8 +90,9 @@ public class ColdChainService {
     @Transactional
     public HandoverRecord initiateHandover(String waybillNo, String fromHolder, String toHolder) {
         Shipment shipment = lockShipment(waybillNo);
-        if (shipment.getStatus() != ShipmentStatus.IN_TRANSIT) {
-            throw ApiException.conflict("SHIPMENT_QUARANTINED", "隔离货物不能发起交接");
+        if (shipment.getStatus() == ShipmentStatus.QUARANTINED
+                || shipment.getStatus() == ShipmentStatus.CONDEMNED) {
+            throw ApiException.conflict("SHIPMENT_QUARANTINED", "隔离/报废货物不能发起交接");
         }
         if (!shipment.getCurrentHolder().equals(fromHolder)) {
             throw ApiException.conflict("NOT_CURRENT_HOLDER", "只有当前持有人可以发起交接");
@@ -113,8 +121,9 @@ public class ColdChainService {
         if (!handover.getToHolder().equals(confirmedBy)) {
             throw ApiException.forbidden("NOT_DESIGNATED_RECEIVER", "只有待确认交接的接收方可以确认");
         }
-        if (shipment.getStatus() != ShipmentStatus.IN_TRANSIT) {
-            throw ApiException.conflict("SHIPMENT_QUARANTINED", "隔离货物不能确认交接");
+        if (shipment.getStatus() == ShipmentStatus.QUARANTINED
+                || shipment.getStatus() == ShipmentStatus.CONDEMNED) {
+            throw ApiException.conflict("SHIPMENT_QUARANTINED", "隔离/报废货物不能确认交接");
         }
         handover.confirm(Instant.now());
         shipment.setCurrentHolder(handover.getToHolder());
@@ -132,34 +141,18 @@ public class ColdChainService {
                 .orElseThrow(() -> ApiException.notFound("运单不存在: " + waybillNo));
     }
 
-    private void recomputeQuarantine(Shipment shipment) {
-        if (shipment.getStatus() == ShipmentStatus.QUARANTINED) {
-            return;
-        }
+    private ExcursionCalculator.Snapshot currentSnapshot(Shipment shipment) {
         List<TemperatureEvent> events =
                 temperatureEventRepository.findByShipmentIdOrderBySampledAtAscIdAsc(shipment.getId());
-        Duration maxBreach = Duration.ofSeconds(shipment.getMaxBreachSeconds());
-        Instant breachStart = null;
-        Instant lastBreachSample = null;
-        for (TemperatureEvent event : events) {
-            boolean outOfRange = event.getTemperature() < shipment.getTempMin()
-                    || event.getTemperature() > shipment.getTempMax();
-            if (outOfRange) {
-                if (breachStart == null) {
-                    breachStart = event.getSampledAt();
-                }
-                lastBreachSample = event.getSampledAt();
-            } else if (breachStart != null) {
-                if (Duration.between(breachStart, event.getSampledAt()).compareTo(maxBreach) >= 0) {
-                    shipment.setStatus(ShipmentStatus.QUARANTINED);
-                    return;
-                }
-                breachStart = null;
-                lastBreachSample = null;
-            }
+        return ExcursionCalculator.analyze(events, shipment.getTempMin(), shipment.getTempMax(),
+                shipment.getMaxBreachSeconds());
+    }
+
+    private void recomputeQuarantine(Shipment shipment) {
+        if (shipment.getStatus() != ShipmentStatus.IN_TRANSIT) {
+            return;
         }
-        if (breachStart != null
-                && Duration.between(breachStart, lastBreachSample).compareTo(maxBreach) >= 0) {
+        if (!currentSnapshot(shipment).isEmpty()) {
             shipment.setStatus(ShipmentStatus.QUARANTINED);
         }
     }
